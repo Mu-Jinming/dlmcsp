@@ -1,0 +1,5 @@
+*.pt
+*.cif
+*.json
+*.csv
+**/samples/
