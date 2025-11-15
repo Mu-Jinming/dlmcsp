@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 MaterialTokenizer:
-- 从 vocab.yaml 构建 token→id / id→token 映射；
-- 提供 encode(ms_dict) → List[int]；
-- 数值 token 不走 BPE，全部来自 vocab.yaml 规则；
-- 文本关键字用固定表。
+- vocab 只来自 vocab.yaml，训练/推理都不扩表；
+- formula 用元素级别编码（按 formula unit 展开元素）；
+- NATOMS 用离散 token NATOMS_k (k<=512)；
+- Wy token 用 WY:SG_x:wy，完全由 wy_tokens 决定；
 """
+
 from __future__ import annotations
 from typing import Dict, Any, List
 
+from pymatgen.core import Composition
+
 from .vocab_utils import load_vocab_yaml, get_param_conf
 
-
-# 和 vocab_utils 里的 _BASE_FRACTIONS 保持一致，作为兜底
 _DEFAULT_BASE_FRAC = ["0", "1/2", "1/3", "2/3",
                       "1/4", "3/4", "1/6", "5/6",
                       "1/8", "3/8", "5/8", "7/8"]
@@ -33,6 +34,7 @@ class Vocab:
             "FORMULA=", "NATOMS=", "SG=", "LATT=", "SITES=",
             "EL:", "WY:", "PARAM:", "->", ";", ",", "(", ")",
             "u:", "v:", "w:",
+            "-",   # 无参数占位
         ]:
             self._add(t)
 
@@ -46,31 +48,30 @@ class Vocab:
         for t in cfg.get("element_tokens", []):
             self.element_tokens.append(self._add(t))
 
-        # ---------- Wyckoff tokens (flatten) ----------
-        # key = (sg_str, wy_str) -> token_id
+        # ---------- Wyckoff tokens (SG-aware) ----------
+        # key = (sg_str, wy_str) -> token_id, e.g. ("SG_194","4f") -> "WY:SG_194:4f"
         self._wy_map: Dict[tuple[str, str], int] = {}
         for sg, wy_list in cfg.get("wy_tokens", {}).items():
             for wy in wy_list:
-                self._wy_map[(sg, wy)] = self._add(f"WY:{sg}:{wy}")
+                tok_str = f"WY:{sg}:{wy}"
+                self._wy_map[(sg, wy)] = self._add(tok_str)
 
         # ---------- lattice bins ----------
         self._latt_conf = cfg.get("lattice_bins", {})
-        self._latt_bins_tok: Dict[str, List[int]] = {}  # name -> bin token ids
-        self._latt_dr_tok: Dict[str, List[int]] = {}    # name -> dr token ids
+        self._latt_bins_tok: Dict[str, List[int]] = {}
+        self._latt_dr_tok: Dict[str, List[int]] = {}
         for name, conf in self._latt_conf.items():
             nb = int(conf["num_bins"])
-            # BIN tokens
             self._latt_bins_tok[name] = [
                 self._add(f"{name.upper()}_BIN_{i}") for i in range(nb)
             ]
-            # DR tokens
             drs = list(conf.get("residuals", [-2, -1, 0, 1, 2]))
             self._latt_dr_tok[name] = [
                 self._add(f"{name.upper()}_DR_{d}") for d in drs
             ]
 
         # ---------- param tokens ----------
-        pc = get_param_conf(cfg)  # 期望结构: {base:[..], fine:{denom:..}, dr:[..]}
+        pc = get_param_conf(cfg)
         self._param_conf = pc
 
         base_list = pc.get("base", _DEFAULT_BASE_FRAC)
@@ -78,20 +79,29 @@ class Vocab:
         denom = int(fine_conf.get("denom", 96))
         dr_list = pc.get("dr", [-1, 0, 1])
 
-        # BASE_xx
         self._param_base_tok: Dict[str, int] = {
             s: self._add(f"BASE_{s}") for s in base_list
         }
-        # FINE_i
         self._param_fine_tok: List[int] = [
             self._add(f"FINE_{i}") for i in range(denom)
         ]
-        # DR_d
         self._param_dr_tok: Dict[int, int] = {
             int(d): self._add(f"DR_{int(d)}") for d in dr_list
         }
 
-    # ========== basic mapping ==========
+        # ---------- NATOMS tokens ----------
+        self._natoms_tok: Dict[int, int] = {}
+        for t in cfg.get("natoms_tokens", []):
+            idx = self._add(t)
+            if t.startswith("NATOMS_"):
+                try:
+                    n = int(t.split("_")[1])
+                    self._natoms_tok[n] = idx
+                except Exception:
+                    # 忽略坏格式，audit_vocab 时可检查
+                    pass
+
+    # ===== 基础映射 =====
 
     def _add(self, t: str) -> int:
         if t in self._tok2id:
@@ -102,18 +112,22 @@ class Vocab:
         return idx
 
     def token_id(self, t: str) -> int:
+        if t not in self._tok2id:
+            raise KeyError(f"[Vocab] token '{t}' not found in vocab.yaml")
         return self._tok2id[t]
 
     def id_token(self, i: int) -> str:
         return self._id2tok[i]
 
-    # ========== helpers for SG/WY/lattice/param ==========
+    # ===== helpers =====
 
     def wy_token_id(self, sg_token: str, wy: str) -> int:
         key = (sg_token, wy)
         if key not in self._wy_map:
-            # 兜底：动态加入（不推荐频繁触发）
-            return self._add(f"WY:{sg_token}:{wy}")
+            raise KeyError(
+                f"[Vocab] wy-token for ({sg_token},{wy}) not found in wy_tokens; "
+                f"请检查 vocab.yaml 的 wy_tokens 是否覆盖该 SG 的该 Wy letter"
+            )
         return self._wy_map[key]
 
     def lattice_bins(self, name: str) -> List[int]:
@@ -131,23 +145,23 @@ class Vocab:
     def param_dr_ids(self) -> Dict[int, int]:
         return self._param_dr_tok
 
+    def natoms_token_id(self, n: int) -> int:
+        if n not in self._natoms_tok:
+            raise KeyError(
+                f"[Vocab] NATOMS_{n} 不在 natoms_tokens 里；"
+                f"请在 vocab.yaml.natoms_tokens 中补齐（当前范围={sorted(self._natoms_tok.keys())[:5]}...）"
+            )
+        return self._natoms_tok[n]
+
 
 class MaterialTokenizer:
     """
     encode(ms_dict)：
-    输入 ms_dict 形如：
-    {
-      "formula": "CaTiO3",
-      "n_atoms": 5,
-      "sg": 221,
-      "latt": { "a": {"bin":173,"dr":+1}, ... },
-      "sites": [
-          {"el":"Ca","wy":"1a","params":"-"},
-          {"el":"Ti","wy":"1b","params":"-"},
-          {"el":"O","wy":"3c","params":{"u":{...},"v":{...},"w":{...}}}
-      ]
-    }
+    - formula：按 formula unit 展开元素，用 element_tokens；
+    - NATOMS：用单个 NATOMS_k token；
+    - 其他布局与原来一致。
     """
+
     def __init__(self, vocab: Vocab):
         self.vocab = vocab
 
@@ -165,32 +179,41 @@ class MaterialTokenizer:
 
         # ---------- FORMULA ----------
         toks.append(v.token_id("FORMULA="))
-        for ch in ms["formula"]:
-            toks.append(v._add(ch))  # 字面字符纳入词表
+        comp = Composition(ms["formula"])
+        # 这里使用 reduced formula 的计数（formula unit）
+        elems: List[str] = []
+        for el, amt in comp.items():
+            cnt = int(round(float(amt)))
+            elems.extend([el.symbol] * cnt)
+
+        for i, el in enumerate(elems):
+            toks.append(v.token_id(el))  # 必须在 element_tokens 里
+            if i != len(elems) - 1:
+                toks.append(v.token_id(","))
         toks.append(v.token_id(";"))
 
         # ---------- NATOMS ----------
         toks.append(v.token_id("NATOMS="))
-        for ch in str(int(ms["n_atoms"])):
-            toks.append(v._add(ch))
+        natoms = int(ms["n_atoms"])
+        toks.append(v.natoms_token_id(natoms))  # NATOMS_k
         toks.append(v.token_id(";"))
 
         # ---------- SG ----------
         toks.append(v.token_id("SG="))
         sg_tok = f"SG_{int(ms['sg'])}"
-        toks.append(v._add(sg_tok))
+        toks.append(v.token_id(sg_tok))
         toks.append(v.token_id(";"))
 
         # ---------- LATT ----------
         toks.append(v.token_id("LATT="))
-        # 先写 6 个 bin
+        # 6 bins
         for name in ["a", "b", "c", "alpha", "beta", "gamma"]:
             info = ms["latt"][name]
             bin_tok = v.lattice_bins(name)[int(info["bin"])]
             toks.append(bin_tok)
             if name != "gamma":
                 toks.append(v.token_id(","))
-        # 再写 6 个 dr
+        # 6 dr
         for name in ["a", "b", "c", "alpha", "beta", "gamma"]:
             info = ms["latt"][name]
             dr_tok_list = v.lattice_drs(name)
@@ -202,26 +225,28 @@ class MaterialTokenizer:
 
         # ---------- SITES ----------
         toks.append(v.token_id("SITES="))
+        sg_tok = f"SG_{int(ms['sg'])}"
         for i, site in enumerate(ms["sites"]):
             toks.append(v.token_id("("))
 
             # EL
             toks.append(v.token_id("EL:"))
             el = str(site["el"])
-            toks.append(v.token_id(el) if el in v._tok2id else v._add(el))
+            toks.append(v.token_id(el))
             toks.append(v.token_id(","))
 
-            # WY（不在这里区分 SG，只存 "WY:3c" 这类）
+            # WY (SG-aware)
             toks.append(v.token_id("WY:"))
-            wy = str(site["wy"])   # e.g. "3c"
-            toks.append(v._add(f"WY:{wy}"))
+            wy = str(site["wy"])      # e.g. "4f"
+            wy_id = v.wy_token_id(sg_tok, wy)
+            toks.append(wy_id)
             toks.append(v.token_id(","))
 
             # PARAM
             toks.append(v.token_id("PARAM:"))
             params = site.get("params", "-")
             if params == "-" or params is None:
-                toks.append(v._add("-"))
+                toks.append(v.token_id("-"))
             else:
                 first = True
                 for axis in ("u", "v", "w"):
@@ -230,13 +255,12 @@ class MaterialTokenizer:
                     if not first:
                         toks.append(v.token_id(","))
                     first = False
-                    toks.append(v._add(f"{axis}:"))
+                    toks.append(v.token_id(f"{axis}:"))
                     p = params[axis]
                     if p["mode"] == "BASE":
                         base_id = v.param_base_ids()[p["base"]]
                         toks.append(base_id)
                     else:
-                        # FINE + 可选 DR
                         idx = int(p["idx"])
                         toks.append(v.param_fine_ids()[idx])
                         dr = int(p.get("dr", 0))
@@ -253,20 +277,15 @@ class MaterialTokenizer:
 
     @staticmethod
     def _dr_index(name: str, dr: int, v: Vocab) -> int:
-        """
-        在该维度的 DR token 列表里找到对应 dr 的索引；
-        若找不到，则退到中间值。
-        """
         tok_ids = v.lattice_drs(name)
         dr_values = []
         for tid in tok_ids:
-            t = v.id_token(tid)          # e.g. "ALPHA_DR_-1"
+            t = v.id_token(tid)
             try:
                 d = int(t.split("_")[-1])
             except Exception:
                 d = 0
             dr_values.append(d)
-
         if dr in dr_values:
             return dr_values.index(dr)
         return len(dr_values) // 2

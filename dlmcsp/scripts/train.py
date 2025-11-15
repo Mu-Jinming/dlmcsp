@@ -169,8 +169,7 @@ def _collect_positions_and_values(
 def collate(batch: List[Dict[str, Any]], tok: MaterialTokenizer):
     PAD_id = tok.vocab.token_id("<PAD>") if "<PAD>" in tok.vocab._tok2id else None
     if PAD_id is None:
-        tok.vocab._add("<PAD>")
-        PAD_id = tok.vocab.token_id("<PAD>")
+        raise RuntimeError("[collate] <PAD> must be defined in vocab.yaml")
     id2tok = tok.vocab._id2tok
 
     B = len(batch)
@@ -184,6 +183,12 @@ def collate(batch: List[Dict[str, Any]], tok: MaterialTokenizer):
 
     for b, rec in enumerate(batch):
         seq = rec["tokens"]
+        # 这里假定所有 token id 都 < vocab_size；否则说明 vocab / 预处理不一致
+        if max(seq) >= len(id2tok):
+            raise ValueError(
+                f"[collate] sample {b} contains token id {max(seq)} "
+                f">= vocab_size {len(id2tok)}; 请检查 vocab.yaml 与预处理是否一致"
+            )
         ids[b, :len(seq)] = torch.tensor(seq, dtype=torch.long)
         vm_pos, vm_theta, ga_pos, ga_x = _collect_positions_and_values(seq, rec, id2tok)
         vm_pos_list.append(vm_pos)
@@ -192,38 +197,6 @@ def collate(batch: List[Dict[str, Any]], tok: MaterialTokenizer):
         ga_x_list.append(ga_x)
 
     return ids, vm_pos_list, vm_theta_list, ga_pos_list, ga_x_list
-
-
-def _expand_runtime_vocab(
-    tok: MaterialTokenizer,
-    datasets: List[MsJsonlDataset],
-    runtime_yaml_path: str | None = None
-):
-    """
-    用 train+val 的所有 token id 统一扩 vocab，避免 val 里有更大的 id。
-    """
-    max_id = 0
-    for ds in datasets:
-        for r in ds.recs:
-            if r["tokens"]:
-                m = max(r["tokens"])
-                if m > max_id:
-                    max_id = m
-    V0 = len(tok.vocab._id2tok)
-    if max_id >= V0:
-        for i in range(V0, max_id + 1):
-            tok.vocab._add(f"<EXTRA_{i}>")
-        print(f"[INFO] expanded runtime vocab to size={len(tok.vocab._id2tok)} to cover max token id={max_id}")
-        if runtime_yaml_path:
-            try:
-                import yaml
-                with open(runtime_yaml_path, "w", encoding="utf-8") as f:
-                    yaml.safe_dump({"tokens": tok.vocab._id2tok}, f, allow_unicode=True, sort_keys=False)
-                print(f"[INFO] runtime vocab saved to {runtime_yaml_path} (tokens={len(tok.vocab._id2tok)})")
-            except Exception as e:
-                print(f"[WARN] failed to save runtime vocab yaml: {e}")
-    else:
-        print(f"[INFO] vocab ok. size={V0}, max_id_in_data={max_id}")
 
 
 # ---------- 公共：构造 CE mask 概率表 ----------
@@ -270,7 +243,6 @@ def evaluate(
         ids = ids.to(device)
         B, L = ids.shape
 
-        # 构建和训练时一样的 mask 策略
         probs = p_by_id[ids]          # [B,L]
         probs[ids == PAD_id] = 0.0
         randu = torch.rand_like(probs)
@@ -367,11 +339,11 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--batch", type=int, default=24)
     ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--hidden", type=int, default=512)
-    ap.add_argument("--layers", type=int, default=8)
+    ap.add_argument("--layers", type=int, default=12)
     ap.add_argument("--heads", type=int, default=8)
-    ap.add_argument("--lam", type=float, default=0.2)             # 连续项权重
+    ap.add_argument("--lam", type=float, default=0.5)             # 连续项权重
     ap.add_argument("--label_smoothing", type=float, default=0.05)
 
     # 数值防护超参
@@ -395,18 +367,8 @@ def main():
     else:
         print(f"[WARN] val_data not found: {args.val_data}; skip validation")
 
-    # 2) tokenizer & vocab 扩展（train+val 一起）
+    # 2) tokenizer & vocab（只使用 vocab.yaml，不再扩表）
     tok = MaterialTokenizer.from_yaml(args.vocab)
-
-    runtime_yaml = None
-    try:
-        vdir = os.path.dirname(args.vocab)
-        runtime_yaml = os.path.join(vdir if vdir else ".", "vocab.runtime.yaml")
-    except Exception:
-        pass
-
-    ds_list = [train_ds] + ([val_ds] if val_ds is not None else [])
-    _expand_runtime_vocab(tok, ds_list, runtime_yaml_path=runtime_yaml)
 
     # 3) DataLoader
     train_dl = DataLoader(
@@ -473,7 +435,7 @@ def main():
             ids = ids.to(device)
             B, L = ids.shape
 
-            # ---------- 构建 masked LM 输入 & CE 标签 ----------
+            # ---------- masked LM 输入 & CE 标签 ----------
             probs = p_by_id[ids]   # [B,L]
             probs[ids == PAD_id] = 0.0
 
@@ -584,7 +546,6 @@ def main():
                 f"| regK {val_metrics['regK']:.4f} | regS {val_metrics['regS']:.4f}"
             )
 
-            # 保存最优 val_loss 的模型
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 ck_best = {
@@ -592,10 +553,10 @@ def main():
                         "hidden": args.hidden,
                         "layers": args.layers,
                         "heads": args.heads,
+                        "vocab_size": V,
                     },
                     "model": model.state_dict(),
                     "dof_head": dof.state_dict(),
-                    "runtime_vocab": tok.vocab._id2tok,
                     "stab": {
                         "vm_kappa_max": args.vm_kappa_max,
                         "sigma_min": args.sigma_min,
@@ -612,10 +573,10 @@ def main():
                 "hidden": args.hidden,
                 "layers": args.layers,
                 "heads": args.heads,
+                "vocab_size": V,
             },
             "model": model.state_dict(),
             "dof_head": dof.state_dict(),
-            "runtime_vocab": tok.vocab._id2tok,
             "stab": {
                 "vm_kappa_max": args.vm_kappa_max,
                 "sigma_min": args.sigma_min,

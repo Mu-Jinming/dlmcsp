@@ -12,6 +12,7 @@ from collections import Counter
 
 import torch
 import numpy as np
+import re
 from pymatgen.core import Composition
 
 from dlmcsp.constraints.lattice_tying import lattice_tie_plan, crystal_system_from_sg
@@ -64,8 +65,31 @@ def build_ms_skeleton(formula_pretty: str, natoms: int, sg: int,
 
 # --------- 用 LLaDA 填充 ---------
 
+def _split_formula_elements(formula: str) -> List[str]:
+    """
+    把化学式按元素切分：
+      "GaTe"      -> ["Ga", "Te"]
+      "CaTiO3"    -> ["Ca", "Ti", "O"]    # 目前忽略数字，只编码元素
+      "Li2MnO3"   -> ["Li", "Mn", "O"]
+    """
+    if not formula:
+        return []
+    # 一个元素符号：大写 + 可选小写，如 Ca, Ti, O, Ga
+    return re.findall(r"[A-Z][a-z]?", str(formula))
+
 def _token_id_or_add(vocab: Vocab, t: str) -> int:
-    return vocab._tok2id.get(t, vocab._add(t))
+    """
+    采样阶段禁止扩表：token 必须来自 vocab.yaml。
+    """
+    if t not in vocab._tok2id:
+        raise KeyError(
+            f"[LLaDA-cont sample] token '{t}' 不在 vocab 里；"
+            f"请在 vocab.yaml 中补齐（element_tokens / sg_tokens / wy_tokens / natoms_tokens 等），"
+            f"并重新 preprocess + 训练。"
+        )
+    return vocab._tok2id[t]
+
+
 
 def _position_slots_for_lattice(vocab: Vocab) -> List[Tuple[str, List[int]]]:
     """
@@ -96,43 +120,79 @@ def _position_slots_for_params(vocab: Vocab, ms: Dict[str, Any]) -> List[Tuple[s
                 order += 1
     return slots
 
-def _build_masked_inputs(tok: MaterialTokenizer, ms: Dict[str, Any],
-                         lattice_slots: List[Tuple[str, List[int]]],
-                         param_slots: List[Tuple[str, List[int], Tuple[int,int,str]]]) -> Tuple[List[int], List[Tuple[int, List[int]]], Dict[str, int]]:
+from typing import Dict, Any, List, Tuple
+from pymatgen.core import Composition
+from dlmcsp.tokenization.tokenizer import MaterialTokenizer, Vocab
+
+def _build_masked_inputs(
+    tok: MaterialTokenizer,
+    ms: Dict[str, Any],
+    lattice_slots: List[Tuple[str, List[int]]],
+    param_slots: List[Tuple[str, List[int], Tuple[int, int, str]]],
+) -> Tuple[List[int], List[Tuple[int, List[int]]], Dict[str, int]]:
     """
-    构造带 <MASK> 的 token 序列，并记录每个槽位对应的 token 索引位置 + 该槽位允许的 token ids
+    构造带 <MASK> 的 token 序列，并记录每个槽位对应的 token 位置 + allowed token 列表。
+    注意：布局必须和训练时 tokenizer.encode 一致，否则分布不对齐。
+
+    约定（和新 tokenizer 对齐）：
+      FORMULA= El1,El2,... ;
+      NATOMS= NATOMS_k ;
+      SG= SG_x ;
+      LATT= <6个BIN,逗号分隔><6个DR,逗号分隔> ;
+      SITES= (EL:...,WY:...,PARAM:...)->... ;
     """
     v = tok.vocab
     ids: List[int] = []
-    pos_map: Dict[str, int] = {}  # 可选：记录关键字段位置
+    pos_map: Dict[str, int] = {}
 
     # <BOS>
     ids.append(v.token_id("<BOS>"))
 
-    # FORMULA= CaTiO3 ;
+    # -------- FORMULA= （按元素、带逗号） ----------
     ids.append(v.token_id("FORMULA="))
-    for ch in ms["formula"]:
-        ids.append(_token_id_or_add(v, ch))
+    formula_str = str(ms.get("formula", ""))
+
+    try:
+        comp = Composition(formula_str)
+    except Exception as e:
+        raise ValueError(f"[build_masked_inputs] 无法解析 formula='{formula_str}': {e}")
+
+    # 用 formula unit 计数展开元素（顺序用 Composition 的顺序；to_material_string_v2 也来自 Composition）
+    elem_seq: List[str] = []
+    for el, amt in comp.items():
+        cnt = int(round(float(amt)))
+        elem_seq.extend([el.symbol] * cnt)
+
+    if not elem_seq:
+        raise ValueError(f"[build_masked_inputs] 解析 formula='{formula_str}' 得到空元素列表")
+
+    for i, elem_sym in enumerate(elem_seq):
+        ids.append(_token_id_or_add(v, elem_sym))  # 必须在 element_tokens 里
+        if i != len(elem_seq) - 1:
+            ids.append(v.token_id(","))
+
     ids.append(v.token_id(";"))
 
-    # NATOMS=
+    # -------- NATOMS= NATOMS_k ; ----------
     ids.append(v.token_id("NATOMS="))
-    for ch in str(int(ms["n_atoms"])):
-        ids.append(_token_id_or_add(v, ch))
+    n_atoms = int(ms["n_atoms"])
+    natoms_tok = f"NATOMS_{n_atoms}"
+    ids.append(_token_id_or_add(v, natoms_tok))
     ids.append(v.token_id(";"))
 
-    # SG=
+    # -------- SG= SG_x ; ----------
     ids.append(v.token_id("SG="))
-    sg_tok = f"SG_{int(ms['sg'])}"
+    sg_int = int(ms["sg"])
+    sg_tok = f"SG_{sg_int}"
     ids.append(_token_id_or_add(v, sg_tok))
     ids.append(v.token_id(";"))
 
-    # LATT=
+    # -------- LATT= （6 BIN + 6 DR，都用 <MASK> 槽位） ----------
     ids.append(v.token_id("LATT="))
     slot_positions: List[Tuple[int, List[int]]] = []
-    # 6 bins
+
+    # 6 bins: a,b,c,alpha,beta,gamma
     for name in ["a", "b", "c", "alpha", "beta", "gamma"]:
-        # 找到该 name 对应的 slot（保证顺序一致）
         for slot_name, allow in lattice_slots:
             if slot_name == f"LATT_{name}_BIN":
                 pos = len(ids)
@@ -141,7 +201,8 @@ def _build_masked_inputs(tok: MaterialTokenizer, ms: Dict[str, Any],
                 if name != "gamma":
                     ids.append(v.token_id(","))
                 break
-    # 6 drs
+
+    # 6 dr: a,b,c,alpha,beta,gamma
     for name in ["a", "b", "c", "alpha", "beta", "gamma"]:
         for slot_name, allow in lattice_slots:
             if slot_name == f"LATT_{name}_DR":
@@ -151,45 +212,63 @@ def _build_masked_inputs(tok: MaterialTokenizer, ms: Dict[str, Any],
                 if name != "gamma":
                     ids.append(v.token_id(","))
                 break
+
     ids.append(v.token_id(";"))
 
-    # SITES=
+    # -------- SITES= ----------
     ids.append(v.token_id("SITES="))
+
+    # 注意：WY token 采用 SG-aware 形式：WY:SG_194:4f
     for si, site in enumerate(ms["sites"]):
         ids.append(v.token_id("("))
+
+        # EL:
         ids.append(v.token_id("EL:"))
-        ids.append(_token_id_or_add(v, site["el"]))
+        el_sym = str(site["el"])
+        ids.append(_token_id_or_add(v, el_sym))
         ids.append(v.token_id(","))
+
+        # WY:
         ids.append(v.token_id("WY:"))
-        ids.append(_token_id_or_add(v, f"WY:{site['wy']}"))
+        wy_str = str(site["wy"])  # e.g. "4f"
+        wy_tok = f"WY:{sg_tok}:{wy_str}"
+        ids.append(_token_id_or_add(v, wy_tok))
         ids.append(v.token_id(","))
+
+        # PARAM:
         ids.append(v.token_id("PARAM:"))
-        if site["params"] == "-" or not isinstance(site["params"], dict):
+        params = site.get("params", "-")
+        if params == "-" or not isinstance(params, dict):
             ids.append(_token_id_or_add(v, "-"))
         else:
             first = True
             for axis in ("u", "v", "w"):
-                if axis in site["params"]:
-                    if not first:
-                        ids.append(v.token_id(","))
-                    ids.append(_token_id_or_add(v, f"{axis}:"))
-                    # 槽位（仅 BASE）
-                    for slot_name, allow, triple in param_slots:
-                        i, order, ax = triple
-                        if i == si and ax == axis:
-                            pos = len(ids)
-                            ids.append(v.token_id("<MASK>"))
-                            slot_positions.append((pos, allow))
-                            break
-                    first = False
+                if axis not in params:
+                    continue
+                if not first:
+                    ids.append(v.token_id(","))
+                first = False
+                ids.append(_token_id_or_add(v, f"{axis}:"))
+                # 对应 param_slots 里的 <MASK> 槽位（只填 BASE/FINE+DR）
+                for slot_name, allow, triple in param_slots:
+                    site_idx, order_idx, ax = triple
+                    if site_idx == si and ax == axis:
+                        pos = len(ids)
+                        ids.append(v.token_id("<MASK>"))
+                        slot_positions.append((pos, allow))
+                        break
+
         ids.append(v.token_id(")"))
         if si != len(ms["sites"]) - 1:
             ids.append(v.token_id("->"))
+
     ids.append(v.token_id(";"))
 
     # <EOS>
     ids.append(v.token_id("<EOS>"))
+
     return ids, slot_positions, pos_map
+
 
 def _masked_argmax(logits_row: torch.Tensor, allow: List[int]) -> int:
     mask = torch.full_like(logits_row, fill_value=float("-inf"))
@@ -402,8 +481,11 @@ def decode_ms_from_ids(tok: MaterialTokenizer, ids: List[int], vocab_yaml: str) 
             cur_site["el"] = toks[k+1]
         elif t == "WY:":
             wy_tok = toks[k+1]
+            # 现在形如 "WY:SG_194:4f"
             assert wy_tok.startswith("WY:")
-            cur_site["wy"] = wy_tok.split("WY:")[1]
+            parts = wy_tok.split(":")
+            wy = parts[-1]            # 取最后一段 "4f"
+            cur_site["wy"] = wy
         elif t == "PARAM:":
             # 尝试读取轴标签与 BASE_* token
             params = {}
