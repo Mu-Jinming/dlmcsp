@@ -1,5 +1,6 @@
 *.pt
 *.cif
 *.json
+*.jsonl
 *.csv
 **/samples/
