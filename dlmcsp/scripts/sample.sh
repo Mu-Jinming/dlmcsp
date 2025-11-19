@@ -6,5 +6,4 @@ python -m dlmcsp.scripts.sample \
     --outdir /home/jmmu/dlmcsp/dlmcsp/out \
     --out_jsonl /home/jmmu/dlmcsp/dlmcsp/out/llada_cont.test_samples.jsonl \
     --t 0.15 \
-    --limit 200
 
