@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from dlmcsp.models.llada import LLaDA
@@ -130,6 +131,16 @@ def build_id_is_train(token_types: List[str]) -> torch.Tensor:
     return arr
 
 
+def build_id_mask_for_type(token_types: List[str], type_name: str) -> torch.Tensor:
+    """id -> 是否属于某个具体类型"""
+    V = len(token_types)
+    arr = torch.zeros(V, dtype=torch.bool)
+    for tid in range(V):
+        if token_types[tid] == type_name:
+            arr[tid] = True
+    return arr
+
+
 def build_id2type_id(token_types: List[str], type_id_map: Dict[str, int]) -> torch.Tensor:
     """id -> type_id（用于 token-type embedding）"""
     V = len(token_types)
@@ -152,13 +163,22 @@ def apply_mask_and_get_labels(
     id_is_train: torch.Tensor,
     id_is_predict: torch.Tensor,
     t: torch.Tensor | None = None,
+    # 类型级别 mask 频率调制
+    id_is_latt_bin: torch.Tensor | None = None,
+    id_is_param_base: torch.Tensor | None = None,
+    id_is_param_fine: torch.Tensor | None = None,
+    id_is_sg: torch.Tensor | None = None,
+    id_is_wy: torch.Tensor | None = None,
+    mask_scale_skel: float = 1.0,
+    mask_scale_fine: float = 1.0,
+    mask_scale_sym: float = 1.0,
 ):
     """
     核心：
       - 只在 TRAIN_TYPES 上做随机 mask 并回传梯度（SG/WY 也训练）；
       - 评价 / 日志仍然主要关注 PREDICT_TYPES；
-      - t: 每个样本的平均 mask 概率（[B]），由外部 curriculum 控制。
-        若 t=None，则退化为 t~U(0,1) 的 old 行为。
+      - t: 每个样本的「基准」平均 mask 概率（[B]），由外部 curriculum 控制；
+      - mask_scale_*: 按类型放大 / 缩小 mask 概率，实现“先骨架、后细节”的 curriculum。
     """
     device = ids.device
     B, L = ids.shape
@@ -171,9 +191,35 @@ def apply_mask_and_get_labels(
     if t is None:
         t = torch.rand(B, device=device)
 
-    # 独立 Bernoulli(t_b) 采样，只对 TRAIN_TYPES 位置生效
+    # 基准 mask 概率矩阵 [B,L]
+    p_base = t.view(B, 1).expand(B, L)
+    p_mask = p_base.clone()
+
+    # skeleton = LATT_BIN + PARAM_BASE
+    if id_is_latt_bin is not None and id_is_param_base is not None and mask_scale_skel != 1.0:
+        is_skel = (id_is_latt_bin[ids] | id_is_param_base[ids])
+        p_mask[is_skel] = p_mask[is_skel] * mask_scale_skel
+
+    # fine
+    if id_is_param_fine is not None and mask_scale_fine != 1.0:
+        is_fine = id_is_param_fine[ids]
+        p_mask[is_fine] = p_mask[is_fine] * mask_scale_fine
+
+    # SG/WY 视作对称结构 token，单独控制
+    if (id_is_sg is not None or id_is_wy is not None) and mask_scale_sym != 1.0:
+        is_sym = torch.zeros_like(ids, dtype=torch.bool)
+        if id_is_sg is not None:
+            is_sym |= id_is_sg[ids]
+        if id_is_wy is not None:
+            is_sym |= id_is_wy[ids]
+        p_mask[is_sym] = p_mask[is_sym] * mask_scale_sym
+
+    # 概率裁剪到 [0,1]
+    p_mask = p_mask.clamp(min=0.0, max=1.0)
+
+    # 独立 Bernoulli(p_mask) 采样，只对 TRAIN_TYPES 位置生效
     randu = torch.rand(B, L, device=device)
-    mask_bool = (randu < t.view(B, 1)) & is_train  # [B,L]
+    mask_bool = (randu < p_mask) & is_train  # [B,L]
 
     # 避免某些样本一个训练位置都没 mask（导致这个样本无梯度）
     for b in range(B):
@@ -307,8 +353,6 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     """
     preset = (args.preset or "base").lower()
 
-    # 先确保这些字段存在（None 表示“未显式指定”）
-    # （解析时已经是 None，这里只是保险）
     for k in ["hidden", "layers", "heads",
               "dropout", "lr", "label_smoothing",
               "batch", "epochs"]:
@@ -451,6 +495,13 @@ def main():
     id_is_train   = build_id_is_train(token_types).to(device)
     id2type_id    = build_id2type_id(token_types, type_id_map).to(device)
 
+    # 类型级 bool mask（按 id）
+    id_is_latt_bin   = build_id_mask_for_type(token_types, "LATT_BIN").to(device)
+    id_is_param_base = build_id_mask_for_type(token_types, "PARAM_BASE").to(device)
+    id_is_param_fine = build_id_mask_for_type(token_types, "PARAM_FINE").to(device)
+    id_is_sg         = build_id_mask_for_type(token_types, "SG").to(device)
+    id_is_wy         = build_id_mask_for_type(token_types, "WY").to(device)
+
     n_token_types = len(type_id_map)
 
     # ---------------- 模型 ----------------
@@ -495,17 +546,13 @@ def main():
         f"base_lr={args.lr:.2e}, eta_min={args.lr * eta_min_ratio:.2e}"
     )
 
-    ce = nn.CrossEntropyLoss(
-        ignore_index=-100,
-        label_smoothing=args.label_smoothing,
-    )
-
     global_step = 0
     best_val_loss = float("inf")
     t0 = time.time()
     training_done = False
 
-    # curriculum 超参（你可以根据实验再调）
+    # curriculum 超参
+    # t 相关：easy 段 & full 段
     t_easy_min, t_easy_max = 0.05, 0.20
     t_full_min, t_full_max = 0.05, 0.95
     max_easy_ratio = 0.7  # 训练早期最多 70% sample 走“低噪声”
@@ -516,7 +563,6 @@ def main():
 
         model.train()
         epoch_loss = 0.0
-        epoch_ce = 0.0
         n_batches = 0
 
         for ids in train_dl:
@@ -528,9 +574,10 @@ def main():
             ids = ids.to(device)
             B = ids.size(0)
 
-            # --------- t curriculum: teacher-forcing → full noise ---------
+            # --------- 训练进度 [0,1] ---------
             progress = min(1.0, global_step / max(1, total_steps))
 
+            # --------- t curriculum: teacher-forcing → full noise ---------
             # 早期 p_easy 大，后期逐渐降低到 0
             p_easy = max_easy_ratio * max(0.0, 1.0 - progress)  # [0, max_easy_ratio]
 
@@ -543,6 +590,29 @@ def main():
 
             choose_easy = (torch.rand(B, device=device) < p_easy)
             t_batch = torch.where(choose_easy, t_easy, t_full)
+
+            # --------- 类型级 curriculum：先骨架，后细节 ---------
+            # mask 频率：早期 skeleton 多 mask，fine 少；后期反过来
+            if progress < 0.5:
+                # 阶段 1：骨架优先
+                mask_scale_skel = 1.3
+                mask_scale_fine = 0.5  # 原来 0.3，太容易泄露，抬高一点
+            elif progress < 0.8:
+                # 阶段 2：平衡过渡
+                alpha = (progress - 0.5) / 0.3  # 0~1
+                mask_scale_skel = 1.3 - 0.4 * alpha   # 1.3 -> 0.9
+                mask_scale_fine = 0.5 + 0.5 * alpha   # 0.5 -> 1.0
+            else:
+                # 阶段 3：细节优先
+                alpha = (progress - 0.8) / 0.2        # 0~1
+                mask_scale_skel = 0.9                 # 骨架不再继续减，固定 ≳1 的附近
+                mask_scale_fine = 1.0 + 0.5 * alpha   # 1.0 -> 1.5
+
+            # 对 FINE 的 mask scaling 加下限，避免长期几乎不 mask 造成“抄答案”
+            mask_scale_fine = max(mask_scale_fine, 0.6)
+
+            # SG/WY 一直当作“结构标签”，mask 频率稍低一点，不让模型老是把它们盖掉
+            mask_scale_sym = 0.7
 
             (
                 inputs,
@@ -559,12 +629,72 @@ def main():
                 id_is_train,
                 id_is_predict,
                 t=t_batch,
+                id_is_latt_bin=id_is_latt_bin,
+                id_is_param_base=id_is_param_base,
+                id_is_param_fine=id_is_param_fine,
+                id_is_sg=id_is_sg,
+                id_is_wy=id_is_wy,
+                mask_scale_skel=mask_scale_skel,
+                mask_scale_fine=mask_scale_fine,
+                mask_scale_sym=mask_scale_sym,
             )
             type_ids = make_type_id_tensor(ids, id2type_id)
 
             logits = model(inputs, t_used, token_type_ids=type_ids)
             V_ = logits.size(-1)
-            loss_ce = ce(logits.view(-1, V_), labels.view(-1))
+
+            # --------- 类型感知 loss reweight：先骨架、后细节 ---------
+            # skeleton = LATT_BIN + PARAM_BASE
+            pos_is_latt_bin   = id_is_latt_bin[ids]
+            pos_is_param_base = id_is_param_base[ids]
+            pos_is_param_fine = id_is_param_fine[ids]
+            pos_is_sg         = id_is_sg[ids]
+            pos_is_wy         = id_is_wy[ids]
+
+            # 进度相关权重（先算“基线”，然后对 w_skel 做下限裁剪）：
+            if progress < 0.4:
+                # 阶段 1：强推骨架，细节基本不管
+                phase = progress / 0.4  # 0~1
+                w_skel_base = 1.8 - 0.4 * phase   # 1.8 -> 1.4
+                w_fine      = 0.2 + 0.6 * phase   # 0.2 -> 0.8
+            elif progress < 0.8:
+                # 阶段 2：骨架和细节拉平到 ~1
+                phase = (progress - 0.4) / 0.4
+                w_skel_base = 1.4 - 0.4 * phase   # 1.4 -> 1.0
+                w_fine      = 0.8 + 0.2 * phase   # 0.8 -> 1.0
+            else:
+                # 阶段 3：细节优先，但骨架惩罚不低于 1.0
+                phase = (progress - 0.8) / 0.2
+                w_skel_base = 1.0 - 0.3 * phase   # 1.0 -> 0.7 (基线)
+                w_fine      = 1.0 + 1.0 * phase   # 1.0 -> 2.0
+
+            # 硬约束：骨架 loss 权重永远 >= 1.0，防止后期为了 FINE 而“牺牲” lattice
+            w_skel = max(w_skel_base, 1.0)
+
+            # SG/WY 一直给个中等权重，防止完全忽略
+            w_sym = 0.7
+
+            ce_raw = F.cross_entropy(
+                logits.view(-1, V_),
+                labels.view(-1),
+                ignore_index=-100,
+                reduction="none",
+                label_smoothing=args.label_smoothing,
+            ).view(B, -1)
+
+            valid = (labels != -100)
+
+            w = torch.ones_like(ce_raw)
+            # skeleton: LATT_BIN + PARAM_BASE
+            w[pos_is_latt_bin | pos_is_param_base] *= w_skel
+            # fine
+            w[pos_is_param_fine] *= w_fine
+            # SG/WY
+            w[pos_is_sg | pos_is_wy] *= w_sym
+
+            # 归一化加权 loss
+            w_valid = w * valid
+            loss_ce = (ce_raw * w_valid).sum() / (w_valid.sum() + 1e-8)
             loss = loss_ce
 
             if not torch.isfinite(loss):
@@ -579,25 +709,26 @@ def main():
             scheduler.step()
 
             epoch_loss += float(loss.item())
-            epoch_ce += float(loss_ce.item())
             n_batches += 1
 
             if global_step % 50 == 0:
                 lr_now = scheduler.get_last_lr()[0]
                 print(
                     f"[训练] epoch {epoch} step {global_step}/{total_steps} | "
-                    f"lr {lr_now:.2e} | loss {loss.item():.4f} | CE {loss_ce.item():.4f} | "
+                    f"lr {lr_now:.2e} | loss {loss.item():.4f} | "
                     f"t_mean={t_mean:.4f} | "
                     f"mask_pred={mask_ratio_predict:.4f} | "
                     f"mask_train={mask_ratio_train:.4f} | "
                     f"mask_all={mask_ratio_all:.4f} | "
-                    f"p_easy={p_easy:.3f}"
+                    f"p_easy={p_easy:.3f} | "
+                    f"w_skel={w_skel:.2f} | w_fine={w_fine:.2f} | "
+                    f"mask_scale_skel={mask_scale_skel:.2f} | mask_scale_fine={mask_scale_fine:.2f}"
                 )
 
         if n_batches > 0:
             print(
                 f"[训练] epoch {epoch} 总结 | "
-                f"mean loss {epoch_loss/n_batches:.4f} | mean CE {epoch_ce/n_batches:.4f}"
+                f"mean loss {epoch_loss/n_batches:.4f}"
             )
 
         # ---------------- 验证 & 保存 ----------------
