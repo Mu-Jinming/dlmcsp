@@ -3,4 +3,9 @@ python -m dlmcsp.scripts.sample_disc_remask \
   --vocab /home/jmmu/dlmcsp/configs/vocab.yaml \
   --ckpt /home/jmmu/dlmcsp/dlmcsp/ckpts/llada_cont.best.pt \
   --out  /home/jmmu/dlmcsp/dlmcsp/outputs/test.disc.pred.jsonl \
-  --steps 16 --r_init 1.0 --r_final 0.1 --gamma 1.0
+  --batch 256 \
+  --steps 20 \
+  --temp_init 1.2 --temp_final 0.7 \
+  --gumbel_scale 0.2 \
+  --schedule cosine \
+  --r_init 1.0 --r_final 0.1 --gamma 1.5

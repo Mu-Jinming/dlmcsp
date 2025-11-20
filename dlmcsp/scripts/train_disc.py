@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import argparse, json, os, time
+import argparse, json, os, time, math
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -20,8 +20,12 @@ PUNCTS = {
     "(", ")", "->", ";", ","
 }
 
-# 只在这些类型上做预测 / 评估
+# 只在这些类型上做「最终预测 / 评估」
 PREDICT_TYPES = {"LATT_BIN", "PARAM_BASE", "PARAM_FINE"}
+
+# 参与训练（mask & 反传梯度）的 token 类型：
+# 把 SG / WY 也放进来，让模型真正学上下文结构。
+TRAIN_TYPES = PREDICT_TYPES | {"SG", "WY"}
 
 
 def classify_token(tok_str: str) -> str:
@@ -35,7 +39,7 @@ def classify_token(tok_str: str) -> str:
                                  "ALPHA_BIN_", "BETA_BIN_", "GAMMA_BIN_")):
             return "LATT_BIN"
 
-    # DR 类型（这里只做统计，训练不预测）
+    # DR 类型（这里只做统计，不训练）
     if "_DR_" in up:
         if any(x in up for x in ("A_DR_", "B_DR_", "C_DR_",
                                  "ALPHA_DR_", "BETA_DR_", "GAMMA_DR_")):
@@ -100,17 +104,28 @@ def build_token_types(vocab) -> Tuple[List[str], Dict[str, int], Dict[str, int]]
     all_types = sorted(type_count.keys())
     type_id_map = {tname: idx for idx, tname in enumerate(all_types)}
 
-    print("[INFO] token type counts:", {k: v for k, v in type_count.items() if v > 0})
+    print("[INFO] token type counts:",
+          {k: v for k, v in type_count.items() if v > 0})
     print("[INFO] token type id map:", type_id_map)
     return types, type_count, type_id_map
 
 
 def build_id_is_predict(token_types: List[str]) -> torch.Tensor:
-    """id -> 是否属于需要预测的类型"""
+    """id -> 是否属于需要「最终预测 / 评估」的类型 (LATT_BIN / PARAM_BASE / PARAM_FINE)"""
     V = len(token_types)
     arr = torch.zeros(V, dtype=torch.bool)
     for tid in range(V):
         if token_types[tid] in PREDICT_TYPES:
+            arr[tid] = True
+    return arr
+
+
+def build_id_is_train(token_types: List[str]) -> torch.Tensor:
+    """id -> 是否参与训练 (mask & 反传梯度) 的类型"""
+    V = len(token_types)
+    arr = torch.zeros(V, dtype=torch.bool)
+    for tid in range(V):
+        if token_types[tid] in TRAIN_TYPES:
             arr[tid] = True
     return arr
 
@@ -134,24 +149,38 @@ def apply_mask_and_get_labels(
     ids: torch.Tensor,
     PAD_id: int,
     MASK_id: int,
+    id_is_train: torch.Tensor,
     id_is_predict: torch.Tensor,
+    t: torch.Tensor | None = None,
 ):
     """
-    核心：只在 PREDICT_TYPES 上做随机 mask，mask 概率 = t ~ U(0,1)
-    其他 token 不训练、不回传梯度。
+    核心：
+      - 只在 TRAIN_TYPES 上做随机 mask 并回传梯度（SG/WY 也训练）；
+      - 评价 / 日志仍然主要关注 PREDICT_TYPES；
+      - t: 每个样本的平均 mask 概率（[B]），由外部 curriculum 控制。
+        若 t=None，则退化为 t~U(0,1) 的 old 行为。
     """
     device = ids.device
     B, L = ids.shape
 
-    # t ~ U(0,1) per sample
-    t = torch.rand(B, device=device)  # [B]
+    # TRAIN / PREDICT 位置 (bool [B,L])
+    is_train   = id_is_train[ids]   & (ids != PAD_id)
+    is_predict = id_is_predict[ids] & (ids != PAD_id)
 
-    # PREDICT_TYPES & 非 PAD 的位置才可能被 mask
-    is_predict = id_is_predict[ids] & (ids != PAD_id)   # [B,L]
+    # 如果外部没给 t，就自己采一个 U(0,1)
+    if t is None:
+        t = torch.rand(B, device=device)
 
-    # 独立 Bernoulli(t_b) 采样
+    # 独立 Bernoulli(t_b) 采样，只对 TRAIN_TYPES 位置生效
     randu = torch.rand(B, L, device=device)
-    mask_bool = (randu < t.view(B, 1)) & is_predict     # [B,L]
+    mask_bool = (randu < t.view(B, 1)) & is_train  # [B,L]
+
+    # 避免某些样本一个训练位置都没 mask（导致这个样本无梯度）
+    for b in range(B):
+        if is_train[b].any() and not mask_bool[b].any():
+            cand_pos = torch.nonzero(is_train[b], as_tuple=False)
+            idx = torch.randint(0, cand_pos.size(0), (1,), device=device)
+            mask_bool[b, cand_pos[idx]] = True
 
     inputs = ids.clone()
     inputs[mask_bool] = MASK_id
@@ -160,14 +189,27 @@ def apply_mask_and_get_labels(
     labels[~mask_bool] = -100
     labels[ids == PAD_id] = -100
 
+    # 日志统计
     if is_predict.any():
-        mask_ratio_predict = (mask_bool.float().sum() / is_predict.float().sum()).item()
+        mr_predict = (
+            (mask_bool & is_predict).float().sum() /
+            is_predict.float().sum()
+        ).item()
     else:
-        mask_ratio_predict = 0.0
-    mask_ratio_all = mask_bool.float().mean().item()
+        mr_predict = 0.0
+
+    if is_train.any():
+        mr_train = (
+            (mask_bool & is_train).float().sum() /
+            is_train.float().sum()
+        ).item()
+    else:
+        mr_train = 0.0
+
+    mr_all = mask_bool.float().mean().item()
     t_mean = t.mean().item()
 
-    return inputs, labels, t, t_mean, mask_ratio_predict, mask_ratio_all
+    return inputs, labels, t, t_mean, mr_predict, mr_train, mr_all
 
 
 @torch.no_grad()
@@ -176,10 +218,16 @@ def evaluate(
     dl: DataLoader,
     PAD_id: int,
     MASK_id: int,
+    id_is_train: torch.Tensor,
     id_is_predict: torch.Tensor,
     id2type_id: torch.Tensor,
     device: torch.device,
+    mask_gamma: float = 1.0,
 ) -> Dict[str, float]:
+    """
+    验证时也用 masked LM objective，t 固定来自一个“中等噪声”的分布，
+    避免跟训练 curriculum 纠缠在一起。
+    """
     model.eval()
     ce = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.0)
 
@@ -189,12 +237,21 @@ def evaluate(
 
     for ids in dl:
         ids = ids.to(device)
-        inputs, labels, t, _, _, _ = apply_mask_and_get_labels(
-            ids, PAD_id, MASK_id, id_is_predict
+        B = ids.size(0)
+
+        # t_eval ∈ [0.3, 0.7]，带 gamma 形状，稳定一点
+        u = torch.rand(B, device=device)
+        t_min, t_max = 0.3, 0.7
+        t_eval = t_min + (t_max - t_min) * (u ** mask_gamma)
+
+        inputs, labels, t_used, _, _, _, _ = apply_mask_and_get_labels(
+            ids, PAD_id, MASK_id,
+            id_is_train, id_is_predict,
+            t=t_eval,
         )
         type_ids = make_type_id_tensor(ids, id2type_id)
 
-        logits = model(inputs, t, token_type_ids=type_ids)
+        logits = model(inputs, t_used, token_type_ids=type_ids)
         V = logits.size(-1)
         loss_ce = ce(logits.view(-1, V), labels.view(-1))
         loss = loss_ce
@@ -212,6 +269,93 @@ def evaluate(
     }
 
 
+def build_lr_scheduler(
+    opt: torch.optim.Optimizer,
+    total_steps: int,
+    warmup_steps: int,
+    eta_min_ratio: float = 0.1,
+):
+    """
+    Warmup + Cosine LR:
+      - 前 warmup_steps 线性升到 1.0 * lr
+      - 之后余弦退火到 eta_min_ratio * lr
+    """
+    if warmup_steps < 0:
+        warmup_steps = 0
+    if warmup_steps >= total_steps:
+        warmup_steps = max(1, int(0.1 * total_steps))
+
+    def lr_lambda(step: int):
+        # step 从 0 开始计数（PyTorch 内部）
+        if step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+
+        if step >= total_steps:
+            return eta_min_ratio
+
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return eta_min_ratio + (1.0 - eta_min_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+
+
+def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
+    """
+    根据 preset 设置默认超参。
+    显式传入的 cli 参数优先级最高（即 args.xxx 非 None 不会被覆盖）。
+    """
+    preset = (args.preset or "base").lower()
+
+    # 先确保这些字段存在（None 表示“未显式指定”）
+    # （解析时已经是 None，这里只是保险）
+    for k in ["hidden", "layers", "heads",
+              "dropout", "lr", "label_smoothing",
+              "batch", "epochs"]:
+        if getattr(args, k) is None:
+            setattr(args, k, None)
+
+    if preset == "base":
+        # 类似“论文级 base”配置
+        args.hidden           = args.hidden           if args.hidden           is not None else 768
+        args.layers           = args.layers           if args.layers           is not None else 12
+        args.heads            = args.heads            if args.heads            is not None else 12
+        args.dropout          = args.dropout          if args.dropout          is not None else 0.1
+        args.lr               = args.lr               if args.lr               is not None else 3e-4
+        args.label_smoothing  = args.label_smoothing  if args.label_smoothing  is not None else 0.02
+        args.batch            = args.batch            if args.batch            is not None else 24
+        args.epochs           = args.epochs           if args.epochs           is not None else 50
+
+    elif preset == "large":
+        # 更重一点的版本，注意显存
+        args.hidden           = args.hidden           if args.hidden           is not None else 1024
+        args.layers           = args.layers           if args.layers           is not None else 16
+        args.heads            = args.heads            if args.heads            is not None else 16
+        args.dropout          = args.dropout          if args.dropout          is not None else 0.1
+        args.lr               = args.lr               if args.lr               is not None else 3e-4
+        args.label_smoothing  = args.label_smoothing  if args.label_smoothing  is not None else 0.02
+        args.batch            = args.batch            if args.batch            is not None else 16
+        args.epochs           = args.epochs           if args.epochs           is not None else 60
+
+    elif preset == "custom":
+        # 完全尊重用户传参；如果仍然 None，则给出兜底 default
+        pass
+    else:
+        raise ValueError(f"Unknown preset: {preset}")
+
+    # 对仍为 None 的字段做兜底（防止你传了一半）
+    if args.hidden          is None: args.hidden = 512
+    if args.layers          is None: args.layers = 12
+    if args.heads           is None: args.heads = 8
+    if args.dropout         is None: args.dropout = 0.0
+    if args.lr              is None: args.lr = 5e-5
+    if args.label_smoothing is None: args.label_smoothing = 0.05
+    if args.batch           is None: args.batch = 24
+    if args.epochs          is None: args.epochs = 20
+
+    return args
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train_data", required=True)
@@ -219,19 +363,56 @@ def main():
     ap.add_argument("--vocab", required=True)
     ap.add_argument("--save", required=True)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--batch", type=int, default=24)
-    ap.add_argument("--epochs", type=int, default=20)
+
+    # 预设档位：base / large / custom
+    ap.add_argument(
+        "--preset",
+        type=str,
+        default="base",
+        choices=["base", "large", "custom"],
+        help="超参 preset；base/large 为推荐配置，custom 完全用手动参数"
+    )
+
+    # 这些参数默认 None，由 preset 决定默认值；显式传参优先级更高
+    ap.add_argument("--batch", type=int, default=None)
+    ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--hidden", type=int, default=None)
+    ap.add_argument("--layers", type=int, default=None)
+    ap.add_argument("--heads", type=int, default=None)
+    ap.add_argument("--dropout", type=float, default=None)
+    ap.add_argument("--label_smoothing", type=float, default=None)
+
     ap.add_argument("--max_steps", type=int, default=0)
-    ap.add_argument("--lr", type=float, default=5e-5)  # 建议先用 5e-5 稳一点
-    ap.add_argument("--hidden", type=int, default=512)
-    ap.add_argument("--layers", type=int, default=12)
-    ap.add_argument("--heads", type=int, default=8)
-    ap.add_argument("--dropout", type=float, default=0.0)
-    ap.add_argument("--label_smoothing", type=float, default=0.05)
+
+    # warmup 相关
+    ap.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help="LR warmup 步数；>0 时优先，0 则使用 warmup_ratio",
+    )
+    ap.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.06,
+        help="若 warmup_steps=0，则 warmup_steps = total_steps * warmup_ratio"
+    )
+
+    # mask 噪声形状控制
+    ap.add_argument(
+        "--mask_gamma",
+        type=float,
+        default=2.0,
+        help="控制 full-noise 段 t 分布的 gamma, >1 偏向低噪声 (小 t)",
+    )
+
     args = ap.parse_args()
+    args = apply_preset(args)  # 应用 preset，填好默认值
 
     device = torch.device(args.device)
 
+    # ---------------- 数据集 ----------------
     train_ds = MsJsonlDataset(args.train_data)
     print(f"[INFO] 训练集大小={len(train_ds)}")
     val_ds = None
@@ -247,6 +428,7 @@ def main():
         batch_size=args.batch,
         shuffle=True,
         drop_last=True,
+        num_workers=4,
         collate_fn=lambda b: collate(b, tok),
     )
     val_dl = None
@@ -266,10 +448,12 @@ def main():
 
     token_types, type_count, type_id_map = build_token_types(vocab)
     id_is_predict = build_id_is_predict(token_types).to(device)
-    id2type_id = build_id2type_id(token_types, type_id_map).to(device)
+    id_is_train   = build_id_is_train(token_types).to(device)
+    id2type_id    = build_id2type_id(token_types, type_id_map).to(device)
 
     n_token_types = len(type_id_map)
 
+    # ---------------- 模型 ----------------
     model = LLaDA(
         vocab_size=V,
         hidden=args.hidden,
@@ -287,21 +471,44 @@ def main():
         weight_decay=0.01,
     )
 
+    # ---------------- Scheduler：Warmup + Cosine ----------------
     if args.max_steps > 0:
         total_steps = args.max_steps
     else:
         total_steps = args.epochs * len(train_dl)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=total_steps, eta_min=args.lr * 0.1
-    )
-    print(f"[INFO] 使用 CosineAnnealingLR, T_max={total_steps}")
 
-    ce = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=args.label_smoothing)
+    if args.warmup_steps > 0:
+        warmup_steps = args.warmup_steps
+    else:
+        warmup_steps = int(total_steps * args.warmup_ratio)
+
+    eta_min_ratio = 0.1
+    scheduler = build_lr_scheduler(
+        opt,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+        eta_min_ratio=eta_min_ratio,
+    )
+    print(
+        f"[INFO] 使用 Warmup+Cosine LR, total_steps={total_steps}, "
+        f"warmup_steps={warmup_steps}, "
+        f"base_lr={args.lr:.2e}, eta_min={args.lr * eta_min_ratio:.2e}"
+    )
+
+    ce = nn.CrossEntropyLoss(
+        ignore_index=-100,
+        label_smoothing=args.label_smoothing,
+    )
 
     global_step = 0
     best_val_loss = float("inf")
     t0 = time.time()
     training_done = False
+
+    # curriculum 超参（你可以根据实验再调）
+    t_easy_min, t_easy_max = 0.05, 0.20
+    t_full_min, t_full_max = 0.05, 0.95
+    max_easy_ratio = 0.7  # 训练早期最多 70% sample 走“低噪声”
 
     for epoch in range(1, args.epochs + 1):
         if training_done:
@@ -313,19 +520,49 @@ def main():
         n_batches = 0
 
         for ids in train_dl:
-            if args.max_steps > 0 and global_step >= args.max_steps:
+            if args.max_steps > 0 and global_step >= total_steps:
                 training_done = True
                 break
 
             global_step += 1
             ids = ids.to(device)
+            B = ids.size(0)
 
-            inputs, labels, t, t_mean, mask_ratio_predict, mask_ratio_all = apply_mask_and_get_labels(
-                ids, PAD_id, MASK_id, id_is_predict
+            # --------- t curriculum: teacher-forcing → full noise ---------
+            progress = min(1.0, global_step / max(1, total_steps))
+
+            # 早期 p_easy 大，后期逐渐降低到 0
+            p_easy = max_easy_ratio * max(0.0, 1.0 - progress)  # [0, max_easy_ratio]
+
+            # easy 段：低噪声 t ∈ [0.05, 0.2]
+            t_easy = t_easy_min + (t_easy_max - t_easy_min) * torch.rand(B, device=device)
+
+            # full 段：更广的 t ∈ [0.05, 0.95]，用 gamma 拉形
+            u_full = torch.rand(B, device=device)
+            t_full = t_full_min + (t_full_max - t_full_min) * (u_full ** args.mask_gamma)
+
+            choose_easy = (torch.rand(B, device=device) < p_easy)
+            t_batch = torch.where(choose_easy, t_easy, t_full)
+
+            (
+                inputs,
+                labels,
+                t_used,
+                t_mean,
+                mask_ratio_predict,
+                mask_ratio_train,
+                mask_ratio_all,
+            ) = apply_mask_and_get_labels(
+                ids,
+                PAD_id,
+                MASK_id,
+                id_is_train,
+                id_is_predict,
+                t=t_batch,
             )
             type_ids = make_type_id_tensor(ids, id2type_id)
 
-            logits = model(inputs, t, token_type_ids=type_ids)
+            logits = model(inputs, t_used, token_type_ids=type_ids)
             V_ = logits.size(-1)
             loss_ce = ce(logits.view(-1, V_), labels.view(-1))
             loss = loss_ce
@@ -350,8 +587,11 @@ def main():
                 print(
                     f"[训练] epoch {epoch} step {global_step}/{total_steps} | "
                     f"lr {lr_now:.2e} | loss {loss.item():.4f} | CE {loss_ce.item():.4f} | "
-                    f"t={t_mean:.4f} | mask_ratio_pred={mask_ratio_predict:.4f} | "
-                    f"mask_ratio_all={mask_ratio_all:.4f}"
+                    f"t_mean={t_mean:.4f} | "
+                    f"mask_pred={mask_ratio_predict:.4f} | "
+                    f"mask_train={mask_ratio_train:.4f} | "
+                    f"mask_all={mask_ratio_all:.4f} | "
+                    f"p_easy={p_easy:.3f}"
                 )
 
         if n_batches > 0:
@@ -360,14 +600,18 @@ def main():
                 f"mean loss {epoch_loss/n_batches:.4f} | mean CE {epoch_ce/n_batches:.4f}"
             )
 
-        # 验证 & 保存
+        # ---------------- 验证 & 保存 ----------------
         if val_dl:
             val_metrics = evaluate(
-                model, val_dl,
-                PAD_id, MASK_id,
+                model,
+                val_dl,
+                PAD_id,
+                MASK_id,
+                id_is_train,
                 id_is_predict,
                 id2type_id,
                 device,
+                mask_gamma=args.mask_gamma,
             )
             print(
                 f"[验证] epoch {epoch} | "
@@ -383,6 +627,8 @@ def main():
                         "dropout": args.dropout,
                         "vocab_size": V,
                         "n_token_types": n_token_types,
+                        "max_len": 4096,
+                        "preset": args.preset,
                     },
                     "model": model.state_dict(),
                     "type_id_map": type_id_map,
@@ -399,6 +645,8 @@ def main():
                 "dropout": args.dropout,
                 "vocab_size": V,
                 "n_token_types": n_token_types,
+                "max_len": 4096,
+                "preset": args.preset,
             },
             "model": model.state_dict(),
             "type_id_map": type_id_map,

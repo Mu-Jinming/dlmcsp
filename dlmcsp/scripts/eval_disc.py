@@ -6,14 +6,17 @@ from typing import Any, Dict, List
 
 from dlmcsp.tokenization.tokenizer import MaterialTokenizer
 
-# 与其他脚本保持一致
 PUNCTS = {
     "FORMULA=", "NATOMS=", "SG=", "LATT=", "SITES=",
     "EL:", "WY:", "PARAM:", "u:", "v:", "w:",
     "(", ")", "->", ";", ","
 }
 
-PREDICT_TYPES = {"LATT_BIN", "PARAM_BASE", "PARAM_FINE"}
+# 核心 DOF：跟训练里的 PREDICT_TYPES 保持一致
+DOF_TYPES = {"LATT_BIN", "PARAM_BASE", "PARAM_FINE"}
+
+# 结构相关：SG / WY
+SYM_TYPES = {"SG", "WY"}
 
 
 def classify_token(tok_str: str) -> str:
@@ -21,10 +24,12 @@ def classify_token(tok_str: str) -> str:
     up = s.upper()
 
     if "_BIN_" in up:
-        if any(x in up for x in ("A_BIN_", "B_BIN_", "C_BIN_", "ALPHA_BIN_", "BETA_BIN_", "GAMMA_BIN_")):
+        if any(x in up for x in ("A_BIN_", "B_BIN_", "C_BIN_",
+                                 "ALPHA_BIN_", "BETA_BIN_", "GAMMA_BIN_")):
             return "LATT_BIN"
     if "_DR_" in up:
-        if any(x in up for x in ("A_DR_", "B_DR_", "C_DR_", "ALPHA_DR_", "BETA_DR_", "GAMMA_DR_")):
+        if any(x in up for x in ("A_DR_", "B_DR_", "C_DR_",
+                                 "ALPHA_DR_", "BETA_DR_", "GAMMA_DR_")):
             return "LATT_DR"
         return "PARAM_DR"
 
@@ -57,8 +62,8 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gt", required=True, help="GT jsonl（训练/验证 ms 数据）")
-    ap.add_argument("--pred", required=True, help="sample_disc.py 输出 jsonl（含 tokens_pred）")
+    ap.add_argument("--gt", required=True, help="GT jsonl（train/val ms 数据）")
+    ap.add_argument("--pred", required=True, help="sample_disc_remask 输出 jsonl（含 tokens_pred）")
     ap.add_argument("--vocab", required=True, help="vocab.yaml，用于解析 token 类型")
     args = ap.parse_args()
 
@@ -71,16 +76,31 @@ def main():
     tok = MaterialTokenizer.from_yaml(args.vocab)
     vocab = tok.vocab
 
-    total_masked_tokens = 0
-    correct_masked_tokens = 0
-
+    # ---- 全 token 统计 ----
     total_seqs = 0
-    exact_match_masked = 0  # 所有需要预测位置都对的序列
-
-    # 可选：全 token 统计
     total_all_tokens = 0
     correct_all_tokens = 0
     exact_match_all = 0
+
+    # ---- DOF (LATT_BIN / PARAM_BASE / PARAM_FINE) 统计 ----
+    total_dof_tokens = 0
+    correct_dof_tokens = 0
+    exact_match_dof = 0
+
+    # ---- SYM (SG / WY) 统计 ----
+    total_sym_tokens = 0
+    correct_sym_tokens = 0
+    exact_match_sym = 0
+
+    # ---- 分类型统计：看清哪一类拖后腿 ----
+    type_total: Dict[str, int] = {
+        "LATT_BIN": 0,
+        "PARAM_BASE": 0,
+        "PARAM_FINE": 0,
+        "SG": 0,
+        "WY": 0,
+    }
+    type_correct: Dict[str, int] = {k: 0 for k in type_total.keys()}
 
     for i, (gt, pr) in enumerate(zip(gt_recs, pred_recs)):
         gt_ids = gt["tokens"]
@@ -96,7 +116,7 @@ def main():
         L = len(gt_ids)
         total_seqs += 1
 
-        # 全 token 统计
+        # ---------- 全 token acc / EM ----------
         all_equal = True
         for g, p in zip(gt_ids, pred_ids):
             if g == p:
@@ -107,40 +127,84 @@ def main():
         if all_equal:
             exact_match_all += 1
 
-        # 只在 PREDICT_TYPES 上统计
-        masked_equal = True
+        # ---------- DOF / SYM / 分类型 ----------
+        dof_equal = True   # 该序列在所有 DOF 位置是否全对
+        sym_equal = True   # 该序列在所有 SYM 位置是否全对
+
         for pos in range(L):
             tid = gt_ids[pos]
             tok_str = vocab.id_token(tid)
             t_type = classify_token(tok_str)
-            if t_type in PREDICT_TYPES:
-                total_masked_tokens += 1
+
+            # 分类型统计
+            if t_type in type_total:
+                type_total[t_type] += 1
                 if pred_ids[pos] == tid:
-                    correct_masked_tokens += 1
+                    type_correct[t_type] += 1
+
+            # DOF 部分
+            if t_type in DOF_TYPES:
+                total_dof_tokens += 1
+                if pred_ids[pos] == tid:
+                    correct_dof_tokens += 1
                 else:
-                    masked_equal = False
+                    dof_equal = False
 
-        if masked_equal:
-            exact_match_masked += 1
+            # SYM 部分
+            if t_type in SYM_TYPES:
+                total_sym_tokens += 1
+                if pred_ids[pos] == tid:
+                    correct_sym_tokens += 1
+                else:
+                    sym_equal = False
 
+        if dof_equal:
+            exact_match_dof += 1
+        if sym_equal:
+            exact_match_sym += 1
+
+    # ================= 输出 =================
     print("===== EVAL DISC (token 级 & 序列级) =====")
     print(f"#samples                     : {total_seqs}")
     print(f"#all_tokens                  : {total_all_tokens}")
-    print(f"#masked(PREDICT_TYPES) tokens: {total_masked_tokens}")
+    print(f"#DOF tokens (LATT/PARAM)     : {total_dof_tokens}")
+    print(f"#SYM tokens (SG/WY)          : {total_sym_tokens}")
 
+    # 全 token
     if total_all_tokens > 0:
         acc_all = correct_all_tokens / total_all_tokens
         em_all = exact_match_all / total_seqs
         print(f"[ALL TOKENS] token acc       : {acc_all:.4f}")
         print(f"[ALL TOKENS] seq exact-match : {em_all:.4f}")
 
-    if total_masked_tokens > 0:
-        acc_masked = correct_masked_tokens / total_masked_tokens
-        em_masked = exact_match_masked / total_seqs
-        print(f"[MASKED TOKENS] token acc    : {acc_masked:.4f}")
-        print(f"[MASKED TOKENS] seq EM (on masked positions): {em_masked:.4f}")
+    # DOF
+    if total_dof_tokens > 0:
+        acc_dof = correct_dof_tokens / total_dof_tokens
+        em_dof = exact_match_dof / total_seqs
+        print(f"[DOF (LATT_BIN+PARAM)] token acc    : {acc_dof:.4f}")
+        print(f"[DOF (LATT_BIN+PARAM)] seq EM       : {em_dof:.4f}")
     else:
-        print("[WARN] 没有任何 PREDICT_TYPES token 被统计（检查 PREDICT_TYPES 设置和数据）")
+        print("[WARN] 没有任何 DOF token 被统计（检查 DOF_TYPES 设置和数据）")
+
+    # SYM
+    if total_sym_tokens > 0:
+        acc_sym = correct_sym_tokens / total_sym_tokens
+        em_sym = exact_match_sym / total_seqs
+        print(f"[SYM (SG+WY)] token acc      : {acc_sym:.4f}")
+        print(f"[SYM (SG+WY)] seq EM         : {em_sym:.4f}")
+    else:
+        print("[WARN] 没有任何 SYM token 被统计（检查 SYM_TYPES 设置和数据）")
+
+    # 分类型细节
+    print("----- Per-type token accuracy -----")
+    for tname in ["LATT_BIN", "PARAM_BASE", "PARAM_FINE", "SG", "WY"]:
+        tot = type_total[tname]
+        cor = type_correct[tname]
+        if tot > 0:
+            acc = cor / tot
+            print(f"[{tname}] token acc          : {acc:.4f}  ({cor}/{tot})")
+        else:
+            print(f"[{tname}] token acc          : N/A       (0/0)")
 
 
 if __name__ == "__main__":
